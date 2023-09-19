@@ -1,0 +1,220 @@
+name: JMH CI
+
+env:
+  GITHUB_DEPLOY: 'true'
+
+on:
+  push:
+    branches:
+      - main
+    tags:
+      - '*'
+    paths-ignore:
+      - LICENSE
+      - README.md
+      - 'docs/**'
+      - '.github/config/labels.yml'
+
+  pull_request:
+    branches:
+      - main
+
+  schedule:
+    - cron: "0 0 * * *"
+
+  workflow_dispatch:
+  repository_dispatch:
+    types: [ app-release ]
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  build:
+    if: startsWith(github.event.head_commit.message, 'skip ci') != true
+    name: Run JMH Benchmark.
+    timeout-minutes: 15
+    continue-on-error: false
+
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: true
+      matrix:
+        os: [ ubuntu-latest, macos-latest, windows-latest ]
+        jdk: [ ea ]
+        include:
+          - os: ubuntu-latest
+            cmd: ./mvnw
+          - os: macos-latest
+            cmd: ./mvnw
+          - os: windows-latest
+            cmd: ./mvnw.cmd
+
+    permissions:
+      contents: read
+      packages: write
+
+    outputs:
+      sha-version: ${{ steps.sha-version.outputs.version }}
+
+    steps:
+      - name: Check out the source code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Download OpenJDK ${{ matrix.jdk }} build from jdk.java.net
+        id: download-jdk
+        uses: oracle-actions/setup-java@v1
+        with:
+          website: jdk.java.net
+          release: ${{ matrix.jdk }}
+          version: latest
+
+          install: false
+
+      - name: Download OpenJDK (fallback)
+        if: ${{ false }}
+        run: |
+          download_url="https://download.java.net/java/early_access/jdkea/latest/GPL/openjdk-ea-latest_linux-x64_bin.tar.gz"
+          wget -O $RUNNER_TEMP/java_package.tar.gz $download_url
+
+      - name: Set up OpenJDK ${{ matrix.jdk }} with dep cache
+        id: setup-java
+        uses: actions/setup-java@v3
+        if: always() && steps.download-jdk.outcome == 'success'
+        with:
+          distribution: jdkfile
+          java-version: ${{ steps.download-jdk.outputs.version }}
+          jdkFile: ${{ steps.download-jdk.outputs.archive }}
+          check-latest: true
+          cache: 'maven'
+        # jdkFile: ${{ runner.temp }}/java_package.tar.gz
+        # architecture: x64
+        # settings-path: ${{ github.workspace }} # OR $GITHUB_WORKSPACE
+
+      - name: Print Env
+        shell: bash
+        run: |
+          echo "steps.download-jdk.outputs.file    = ${{ steps.download-jdk.outputs.file }}"
+          echo "steps.download-jdk.outputs.version = ${{ steps.download-jdk.outputs.version }}"
+          echo "steps.setup-java.outputs.path      = ${{ steps.setup-java.outputs.path }}"
+          echo "env.JDK_FILE                       = ${{ env.JDK_FILE }}"
+          echo "env.JDK_VERSION                    = ${{ env.JDK_VERSION }}"
+          echo "GITHUB_ENV                         = $GITHUB_ENV"
+          echo "GITHUB_PATH                        = $GITHUB_PATH"
+          echo "JAVA_HOME                          = $JAVA_HOME"
+          echo "JAVA_HOME_11                       = $JAVA_HOME_11_X64"
+          # echo "JAVA_HOME=$JAVA_HOME_11_X64" >> $GITHUB_ENV
+          # echo "$JAVA_HOME_11_X64/bin" >> $GITHUB_PATH
+
+      - name: Create Version Number
+        id: sha-version
+        run: |
+          SHA_VERSION=$(echo $GITHUB_SHA | cut -c1-7)
+          echo "version=$SHA_VERSION" >>"$GITHUB_OUTPUT"
+
+      - name: Maven Build
+        run: ./mvnw verify
+
+      - name: Deploy to GitHub Packages (Linux)
+        id: maven-deploy
+        if: env.GITHUB_DEPLOY == 'true' && runner.os == 'Linux' && github.event_name == 'push'
+        run: |
+          ./mvnw --settings .mvn/settings.xml clean deploy
+        env:
+          GITHUB_USER: ${{ github.repository_owner }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Run JMH Benchmark
+        if: success()
+        run: |
+          java --enable-preview -jar target/benchmarks.jar -rf json -rff jmh-result-${{ runner.os }}.json
+          # mkdir staging && cp {$result_file,target/benchmarks.jar} staging
+
+      - name: Uploading JMH ${{ matrix.os }} benchmark results
+        uses: actions/upload-artifact@v3
+        with:
+          name: jmh-result-${{ runner.os }}.json
+          path: |
+            *.json
+          if-no-files-found: error
+
+      - name: Uploading JMH ${{ matrix.os }} benchmark jar
+        if: runner.os == 'Linux'
+        uses: actions/upload-artifact@v3
+        with:
+          name: benchmarks-${{ runner.os }}.jar
+          path: |
+            target/benchmarks.jar
+          if-no-files-found: error
+
+  release:
+    name: Release new version.
+    needs: [ build ]
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Print Git SHA version
+        shell: bash
+        run: |
+          echo "The SHA version from build job: ${{ needs.build.outputs.sha-version }}"
+
+      - name: Get the version
+        id: get-version
+        run: |
+          echo "GITHUB_REF = $GITHUB_REF"
+          echo "version=${GITHUB_REF#refs/*/}" >>"$GITHUB_OUTPUT"
+          echo "branch=${GITHUB_REF#refs/heads/}" >>"$GITHUB_OUTPUT"
+          echo "tag=${GITHUB_REF#refs/tags/}" >>"$GITHUB_OUTPUT"
+          # echo "RELEASE_VERSION=${GITHUB_REF#refs/*/}" >> $GITHUB_ENV
+
+      - name: Check out the source code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Build Changelog
+        id: github_release
+        uses: mikepenz/release-changelog-builder-action@v4
+        with:
+          configuration: ".github/config/configuration.json"
+          commitMode: true
+          ignorePreReleases: ${{ !contains(github.ref, '-') }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Download all the build artifacts
+        uses: actions/download-artifact@v3
+        with:
+          path: release-artifacts
+
+      - name: Commit and push JMH Results
+        if: success()
+        run: |
+          # git diff
+          echo "Copying JMH result JSON files to docs..."
+          find release-artifacts -name "*.json" -type f -exec cp -prv "{}" docs \;
+          git config user.name github-actions
+          git config user.email github-actions@github.com
+          git add docs
+          git commit -m "doc: Updated JMH Results" || exit 0
+          # You are not currently on a branch (detached HEAD)
+          git push origin HEAD:${{ github.event.repository.default_branch }}
+
+      # Alternatives are listed here - https://github.com/actions/create-release
+      - name: Github Release
+        uses: softprops/action-gh-release@v1
+        with:
+          # name: Release ${{ steps.get-version.outputs.tag }}
+          # tag_name: ${{ github.ref }}
+          # release_name: ${{ github.ref }}
+          body: ${{ steps.github_release.outputs.changelog }}
+          prerelease: ${{ contains(github.ref, '-rc') || contains(github.ref, '-b') || contains(github.ref, '-a') }}
+          files: |
+            ${{ github.workspace }}/release-artifacts/**
+          fail_on_unmatched_files: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

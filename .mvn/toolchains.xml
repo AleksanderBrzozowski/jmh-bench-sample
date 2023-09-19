@@ -1,0 +1,26 @@
+<?xml version='1.0' encoding='UTF-8'?>
+<toolchains>
+    <!-- JDK toolchains -->
+    <toolchain>
+        <type>jdk</type>
+        <provides>
+            <version>{LTS}</version>
+            <vendor>openjdk</vendor>
+            <!-- vendor>zulu</vendor-->
+            <!-- vendor>adoptopenjdk</vendor-->
+        </provides>
+        <configuration>
+            <jdkHome>/path/to/jdk/{LTS}</jdkHome>
+        </configuration>
+    </toolchain>
+    <toolchain>
+        <type>jdk</type>
+        <provides>
+            <version>{EA}</version>
+            <vendor>openjdk</vendor>
+        </provides>
+        <configuration>
+            <jdkHome>/path/to/jdk/{EA}</jdkHome>
+        </configuration>
+    </toolchain>
+</toolchains>
